@@ -1,3 +1,4 @@
+// ======================= Includes =======================
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -7,23 +8,63 @@
 #include <stdbool.h>
 #include <pthread.h>
 #include <asm-generic/socket.h>
+#include <time.h>
 
+// ======================= Constants =========================
 #define PORT 8080
 #define MAX_PLAYERS 2
 #define BUFFER_SIZE 1024
 #define MAX_SESSIONS 10
+#define BOARD_SIZE 10
+#define MAX_SHIPS 5
+#define WATER '~'
+#define HIT 'X'
+#define SUNK '#'
+#define SHIP 'O'
 
 // ========================= Structures =========================
+
+typedef struct{
+    char name[20];
+    int size;
+} ShipType;
+
+ShipType SHIPS[MAX_SHIPS] = {
+    {"Portaaviones", 5},
+    {"Buque", 4},
+    {"Crucero", 3},
+    {"Destructor", 2},
+    {"Submarino", 1}
+};
+
+typedef struct {
+    char name[20];
+    int size;
+    int hits;
+    int positions[5][2]; 
+} Ship;
+
+typedef struct {
+    char board[BOARD_SIZE][BOARD_SIZE];
+    Ship ships[MAX_SHIPS];
+    int ship_count;
+} Board;
+
 typedef struct {
     char name[50];
     int socket;
     bool ready;
+    Board board;
 } Player;
 
 typedef struct {
     Player players[MAX_PLAYERS];
     bool active;
     pthread_mutex_t lock;
+    int current_turn;
+    time_t turn_start_time;
+    int time_limit;
+    bool game_over;
 } GameSession;
 
 typedef struct {
@@ -31,6 +72,14 @@ typedef struct {
     int max_sessions;
     pthread_mutex_t session_lock;
 } SessionManager;
+
+// ========================= Function Prototypes =========================
+void* handle_game_session(void *arg);
+void send_message(int socket, const char *type, const char *data);
+SessionManager* session_manager_create(int max_sessions);
+int accept_players(SessionManager *manager, int server_fd);
+int setup_server();
+void init_board(Board *board);
 
 // ========================= Functions =========================
 void send_message(int socket, const char *type, const char *data) {
@@ -57,7 +106,7 @@ int accept_players(SessionManager *manager, int server_fd) {
     struct sockaddr_in address;
     socklen_t addrlen = sizeof(address);
     
-    // Buscar sesión disponible
+    // 1. Buscar sesión disponible
     int session_id = -1;
     pthread_mutex_lock(&manager->session_lock);
     
@@ -65,6 +114,7 @@ int accept_players(SessionManager *manager, int server_fd) {
         if (!manager->sessions[i].active) {
             session_id = i;
             manager->sessions[i].active = true;
+            pthread_mutex_init(&manager->sessions[i].lock, NULL);
             break;
         }
     }
@@ -78,11 +128,13 @@ int accept_players(SessionManager *manager, int server_fd) {
     
     GameSession *session = &manager->sessions[session_id];
     
-    // Aceptar jugadores para esta sesión
+    // 2. Aceptar jugadores para esta sesión
     for (int i = 0; i < MAX_PLAYERS; i++) {
         int new_socket;
         if ((new_socket = accept(server_fd, (struct sockaddr *)&address, &addrlen)) < 0) {
             perror("accept");
+            if (i > 0) close(session->players[0].socket);
+            manager->sessions[session_id].active = false;
             continue;
         }
         
@@ -92,6 +144,10 @@ int accept_players(SessionManager *manager, int server_fd) {
         char buffer[BUFFER_SIZE] = {0};
         if (recv(new_socket, buffer, BUFFER_SIZE, 0) <= 0) {
             close(new_socket);
+            for (int j = 0; j < i; j++) {
+                close(session->players[j].socket);
+            }
+            manager->sessions[session_id].active = false;
             i--;
             continue;
         }
@@ -103,15 +159,30 @@ int accept_players(SessionManager *manager, int server_fd) {
         } else {
             send_message(session->players[i].socket, "ERROR", "INVALID_LOGIN");
             close(new_socket);
+            for (int j = 0; j < i; j++) {
+                close(session->players[j].socket);
+            }
+            manager->sessions[session_id].active = false;
             i--;
             continue;
         }
     }
     
-    // Notificar que ambos jugadores están conectados
-    for (int i = 0; i < MAX_PLAYERS; i++) {
-        send_message(session->players[i].socket, "WAITING", "OPPONENT_CONNECTED");
+    // 3. Ambos jugadores conectados - crear hilo del juego
+    pthread_t thread_id;
+    if (pthread_create(&thread_id, NULL, handle_game_session, session)) {
+        perror("Error al crear hilo del juego");
+        
+        for (int i = 0; i < MAX_PLAYERS; i++) {
+            close(session->players[i].socket);
+        }
+        manager->sessions[session_id].active = false;
+        return -1;
     }
+    
+    pthread_detach(thread_id);
+    
+    printf("Sesión %d iniciada\n", session_id);
     
     return session_id;
 }
@@ -148,6 +219,64 @@ int setup_server() {
     return server_fd;
 }
 
+void init_board(Board *board){
+    memset(board->board, WATER, sizeof(board->board));
+    board->ship_count = 0;
+}
+
+void *handle_game_session(void *arg){
+    GameSession *session = (GameSession *)arg;
+
+    // Inicializar tableros
+    for(int i = 0; i < MAX_PLAYERS; i++){
+        init_board(&session->players[i].board);
+        session->players[i].ready = true;
+    }
+
+    session->current_turn = 0;
+    session->game_over = false;
+
+    for(int i = 0; i < MAX_PLAYERS; i++){
+        send_message(session->players[i].socket, "GAME_START", "READY");
+    }
+
+    while (!session->game_over) {
+        Player *current = &session->players[session->current_turn];
+        Player *opponent = &session->players[(session->current_turn + 1) % MAX_PLAYERS];
+        
+        char formatted_message[BUFFER_SIZE];
+        snprintf(formatted_message, sizeof(formatted_message), "Es tu turno, %s", current->name);
+        send_message(current->socket, "YOUR_TURN", formatted_message);
+        send_message(opponent->socket, "WAIT_TURN", "OPPONENT_TURN");
+
+        // Wait answer from current player
+        char buffer[BUFFER_SIZE] = {0};
+        int bytes_received = recv(current->socket, buffer, BUFFER_SIZE, 0);
+        
+        //Space for disconnection from player
+      
+
+        if(strncmp(buffer, "END_TURN|", 9) == 0){
+            session->current_turn = (session->current_turn + 1) % MAX_PLAYERS;
+            printf("Turno cambiado a %s\n", session->players[session->current_turn].name);
+        } else if(strncmp(buffer, "QUIT|", 5) == 0) {
+            send_message(current->socket, "GAME_OVER", "YOU_QUIT");
+            send_message(opponent->socket, "GAME_OVER", "OPPONENT_QUIT");
+            session->game_over = true;
+        } else {
+            send_message(current->socket, "ERROR", "INVALID_COMMAND");
+        }
+    }
+
+    // Close Sockets
+    for (int i = 0; i < MAX_PLAYERS; i++){
+        close(session->players[i].socket);
+    }
+    session->active = false;
+    
+    return NULL;
+}
+
 // ========================= Main =========================
 int main() {
     int server_fd = setup_server();
@@ -161,7 +290,7 @@ int main() {
         if (session_id >= 0) {
             printf("Sesión %d creada con 2 jugadores\n", session_id);
         } else {
-            sleep(1); // Esperar si no hay sesiones disponibles
+            sleep(1);
         }
     }
     
