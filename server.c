@@ -8,7 +8,7 @@
 #include <pthread.h>
 #include <stdbool.h>
 #include <time.h>
- 
+
 // ======================= Constants =========================
 #define PORT 8080
 #define MAX_PLAYERS 2
@@ -25,13 +25,13 @@
 #define LOG_FILE "game_log.txt"
 #define MAX_LOG_LINE 256
 #define LOG_DATE_FORMAT "%Y-%m-%d %H:%M:%S"
- 
+
 // ======================= Structures =======================
 typedef struct {
     char name[20];
     int size;
 } ShipType;
- 
+
 ShipType SHIPS[MAX_SHIPS] = {
     {"Portaaviones", 5},
     {"Buque", 4},
@@ -39,20 +39,20 @@ ShipType SHIPS[MAX_SHIPS] = {
     {"Destructor", 2},
     {"Submarino", 1}
 };
- 
+
 typedef struct {
     char name[20];
     int size;
     int hits;
-    int positions[5][2];
+    int positions[5][2]; 
 } Ship;
- 
+
 typedef struct {
     char board[BOARD_SIZE][BOARD_SIZE];
     Ship ships[MAX_SHIPS];
     int ship_count;
 } Board;
- 
+
 typedef struct {
     char name[50];
     int socket;
@@ -60,7 +60,7 @@ typedef struct {
     Board board;
     bool ships_placed;
 } Player;
- 
+
 typedef struct {
     Player players[MAX_PLAYERS];
     bool active;
@@ -68,15 +68,15 @@ typedef struct {
     int current_turn;
     bool game_over;
 } GameSession;
- 
+
 typedef struct {
     GameSession *sessions;
     int max_sessions;
     pthread_mutex_t session_lock;
 } SessionManager;
- 
+
 // ======================= Function Prototypes =======================
-void send_message(int socket, const char *type, const char *data);
+int send_message(int socket, const char *type, const char *data);
 void init_board(Board *board);
 bool place_ship(Board *board, const char *ship_name, int size, int row, int col, char orientation);
 void* handle_game_session(void *arg);
@@ -84,10 +84,14 @@ SessionManager* session_manager_create(int max_sessions);
 int accept_players(SessionManager *manager, int server_fd);
  
 // ======================= Function Implementations =======================
-void send_message(int socket, const char *type, const char *data) {
+int send_message(int socket, const char *type, const char *data) {
     char message[BUFFER_SIZE];
     snprintf(message, sizeof(message), "%s|%s", type, data);
-    send(socket, message, strlen(message), 0);
+    int result = send(socket, message, strlen(message), 0);
+    if (result < 0) {
+        perror("send error");
+    }
+    return result;
 }
  
 void init_board(Board *board) {
@@ -124,7 +128,7 @@ bool place_ship(Board *board, const char *ship_name, int size, int row, int col,
     board->ship_count++;
     return true;
 }
- 
+
 SessionManager* session_manager_create(int max_sessions) {
     SessionManager *manager = malloc(sizeof(SessionManager));
     manager->max_sessions = max_sessions;
@@ -144,21 +148,32 @@ void* handle_game_session(void *arg) {
         session->players[i].ready = true;
         session->players[i].ships_placed = false;
         for (int s = 0; s < MAX_SHIPS; s++) {
-            char placement_msg[BUFFER_SIZE];
-            snprintf(placement_msg, sizeof(placement_msg), "PLACE_SHIP|%s|%d", SHIPS[s].name, SHIPS[s].size);
-            send_message(session->players[i].socket, "PLACE_SHIP", placement_msg);
-            char buffer[BUFFER_SIZE] = {0};
-            int bytes = recv(session->players[i].socket, buffer, BUFFER_SIZE, 0);
-            if (bytes <= 0 || strncmp(buffer, "SHIP_POS|", 9) != 0) {
-                send_message(session->players[i].socket, "ERROR", "INVALID_SHIP_POSITION");
-                return NULL;
-            }
-            int row, col;
-            char orientation;
-            sscanf(buffer + 9, "%d,%d,%c", &row, &col, &orientation);
-            if (!place_ship(&session->players[i].board, SHIPS[s].name, SHIPS[s].size, row, col, orientation)) {
-                send_message(session->players[i].socket, "ERROR", "INVALID_SHIP_POSITION");
-                return NULL;
+            bool ship_placed = false;
+            while (!ship_placed) {
+                char placement_msg[BUFFER_SIZE];
+                snprintf(placement_msg, sizeof(placement_msg), "PLACE_SHIP|%s|%d", SHIPS[s].name, SHIPS[s].size);
+                send_message(session->players[i].socket, "PLACE_SHIP", placement_msg);
+                char buffer[BUFFER_SIZE] = {0};
+                int bytes = recv(session->players[i].socket, buffer, BUFFER_SIZE, 0);
+                if (bytes <= 0) {
+                    // Error de conexión
+                    return NULL;
+                }
+                
+                if (strncmp(buffer, "SHIP_POS|", 9) != 0) {
+                    send_message(session->players[i].socket, "ERROR", "INVALID_SHIP_POSITION");
+                    continue;  // Reintentar con el mismo barco
+                }
+                
+                int row, col;
+                char orientation;
+                sscanf(buffer + 9, "%d,%d,%c", &row, &col, &orientation);
+                if (!place_ship(&session->players[i].board, SHIPS[s].name, SHIPS[s].size, row, col, orientation)) {
+                    send_message(session->players[i].socket, "ERROR", "INVALID_SHIP_POSITION");
+                    continue;  // Reintentar con el mismo barco
+                }
+                
+                ship_placed = true;  // Barco colocado exitosamente
             }
         }
         session->players[i].ships_placed = true;
@@ -170,11 +185,32 @@ void* handle_game_session(void *arg) {
         Player *current = &session->players[session->current_turn];
         Player *opponent = &session->players[(session->current_turn + 1) % MAX_PLAYERS];
         char buffer[BUFFER_SIZE] = {0};
-        send_message(current->socket, "YOUR_TURN", "Dispara con formato ROW,COL o QUIT|");
-        send_message(opponent->socket, "WAIT_TURN", "Espera al oponente");
+        
+        // Enviar mensajes a los jugadores
+        if (send_message(current->socket, "YOUR_TURN", "Dispara con formato ROW,COL o QUIT|") < 0) {
+            send_message(opponent->socket, "GAME_OVER", "OPPONENT_DISCONNECTED");
+            session->game_over = true;
+            break;
+        }
+        
+        if (send_message(opponent->socket, "WAIT_TURN", "Espera al oponente") < 0) {
+            send_message(current->socket, "GAME_OVER", "OPPONENT_DISCONNECTED");
+            session->game_over = true;
+            break;
+        }
+        
+        // Recibir mensaje del jugador actual
         int bytes_received = recv(current->socket, buffer, BUFFER_SIZE, 0);
         if (bytes_received <= 0) {
-            send_message(opponent->socket, "GAME_OVER", "OPPONENT_DISCONNECTED");
+            // Error o conexión cerrada
+            if (bytes_received == 0) {
+                // Conexión cerrada por el cliente
+                send_message(opponent->socket, "GAME_OVER", "OPPONENT_DISCONNECTED");
+            } else {
+                // Error en recv
+                perror("recv error");
+                send_message(opponent->socket, "GAME_OVER", "OPPONENT_ERROR");
+            }
             session->game_over = true;
             break;
         }
@@ -215,23 +251,63 @@ void* handle_game_session(void *arg) {
             
                 if (sunk) {
                     send_message(current->socket, "RESULT", "SUNK");
+                    
+                    // Verificar si todos los barcos del oponente están hundidos
+                    bool all_ships_sunk = true;
+                    for (int s = 0; s < opponent->board.ship_count; s++) {
+                        Ship *ship = &opponent->board.ships[s];
+                        bool ship_sunk = true;
+                        for (int i = 0; i < ship->size; i++) {
+                            int sr = ship->positions[i][0];
+                            int sc = ship->positions[i][1];
+                            if (opponent->board.board[sr][sc] != HIT) {
+                                ship_sunk = false;
+                                break;
+                            }
+                        }
+                        if (!ship_sunk) {
+                            all_ships_sunk = false;
+                            break;
+                        }
+                    }
+                    
+                    // Si todos los barcos del oponente están hundidos, el juego ha terminado
+                    if (all_ships_sunk) {
+                        send_message(current->socket, "GAME_OVER", "YOU_WIN");
+                        send_message(opponent->socket, "GAME_OVER", "OPPONENT_WIN");
+                        session->game_over = true;
+                        break;
+                    }
                 } else {
                     send_message(current->socket, "RESULT", "HIT");
                 }
+                // No cambiamos el turno si acertó
+                continue;
             } else {
-                opponent->board.board[row][col] = WATER;
+                opponent->board.board[row][col] = '*';  // Marcamos agua con '*'
                 send_message(current->socket, "RESULT", "MISS");
+                // Solo cambiamos el turno si falló
+                session->current_turn = (session->current_turn + 1) % MAX_PLAYERS;
             }
-            session->current_turn = (session->current_turn + 1) % MAX_PLAYERS;
         }
     }
+    
+    // Asegurarnos de que el juego termine correctamente
+    if (session->game_over) {
+        for (int i = 0; i < MAX_PLAYERS; i++) {
+            close(session->players[i].socket);
+        }
+        session->active = false;
+        return NULL;
+    }
+    
     for (int i = 0; i < MAX_PLAYERS; i++) {
         close(session->players[i].socket);
     }
     session->active = false;
     return NULL;
 }
- 
+
 int accept_players(SessionManager *manager, int server_fd) {
     struct sockaddr_in address;
     socklen_t addrlen = sizeof(address);
@@ -285,7 +361,7 @@ int accept_players(SessionManager *manager, int server_fd) {
     pthread_detach(thread_id);
     return session_id;
 }
- 
+
 int main() {
     int server_fd;
     struct sockaddr_in address;
