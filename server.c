@@ -75,7 +75,7 @@ typedef struct {
 // === FUNCIONES ===
 void send_message(int socket, const char *type, const char *data) {
     char message[BUFFER_SIZE];
-    snprintf(message, sizeof(message), "%s|%s", type, data);
+    snprintf(message, sizeof(message), "%s|%s\n", type, data);
     send(socket, message, strlen(message), 0);
 }
 
@@ -294,6 +294,18 @@ void* handle_game_session(void *arg) {
             if (remaining <= 0) {
                 send_message(current->socket, "TURN_END", "TIME_OUT");
                 printf("Tiempo agotado para %s\n", current->name);
+            
+                // Cambiar de turno
+                advance_turn(session);
+                Player *next = &session->players[session->current_turn];
+                Player *waiting = &session->players[(session->current_turn + 1) % MAX_PLAYERS];
+            
+                // Notificar al nuevo jugador que es su turno
+                send_message(next->socket, "YOUR_TURN", "Turno reanudado por timeout del oponente.");
+                send_message(waiting->socket, "WAIT_TURN", "Es tu turno pronto.");
+                
+                // Salir del ciclo del turno actual
+                turn_active = 0;
                 break;
             }
 
@@ -367,10 +379,6 @@ void* handle_game_session(void *arg) {
             }
         }
 
-        if (!session->game_over) {
-            advance_turn(session);
-            printf("Turno cambiado a %s\n", session->players[session->current_turn].name);
-        }
     }
 
     for (int i = 0; i < MAX_PLAYERS; i++) {
