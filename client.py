@@ -1,5 +1,6 @@
 import socket
 import sys
+import signal
 
 HOST = "localhost"
 PORT = 8080
@@ -12,6 +13,18 @@ class BattleshipClient:
         self.my_board = [['~'] * 10 for _ in range(10)]  # barcos propios
         self.enemy_board = [['~'] * 10 for _ in range(10)]  # disparos al enemigo
         self.last_shot = (-1, -1)
+
+        # Capturar Ctrl+C (SIGINT)
+        signal.signal(signal.SIGINT, self.handle_sigint)
+
+    def handle_sigint(self, sig, frame):
+        print("\n[Cerrando conexión por Ctrl+C]")
+        try:
+            self.send_message("QUIT|")
+            self.sock.close()
+        except:
+            pass
+        sys.exit(0)
 
     def connect(self):
         try:

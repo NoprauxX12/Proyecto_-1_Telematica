@@ -171,11 +171,15 @@ SessionManager* session_manager_create(int max_sessions) {
 
 void* handle_game_session(void *arg) {
     GameSession *session = (GameSession *)arg;
+    const int TURN_TIME_SECONDS = 30;
+    time_t turn_start_time;
+
     FILE *log_file = fopen(LOG_FILE, "a");
     if (!log_file) return NULL;
 
     log_game_start(log_file, session->players[0].name, session->players[1].name);
 
+    // Inicializar tableros y ubicar barcos
     for (int i = 0; i < MAX_PLAYERS; i++) {
         init_board(&session->players[i].board);
         session->players[i].ready = true;
@@ -186,6 +190,38 @@ void* handle_game_session(void *arg) {
             snprintf(placement_msg, sizeof(placement_msg), "%s|%d", SHIPS[s].name, SHIPS[s].size);
             send_message(session->players[i].socket, "PLACE_SHIP", placement_msg);
 
+            // === MANEJO DE TIEMPO Y DESCONECTADOS ===
+            fd_set read_fds;
+            FD_ZERO(&read_fds);
+            FD_SET(session->players[i].socket, &read_fds);
+            struct timeval timeout = { .tv_sec = 30, .tv_usec = 0 };
+
+            int activity = select(session->players[i].socket + 1, &read_fds, NULL, NULL, &timeout);
+            if (activity <= 0) {
+                printf("[!] %s no respondió al ubicar barco %s\n", session->players[i].name, SHIPS[s].name);
+                int other = (i == 0) ? 1 : 0;
+                send_message(session->players[other].socket, "GAME_OVER", "OPPONENT_DISCONNECTED");
+                send_message(session->players[other].socket, "VICTORY", "WINNING_PLAYER");
+                log_game_end(log_file, session->players[other].name, session->players[i].name);
+                session->game_over = true;
+                fclose(log_file);
+                return NULL;
+            }
+
+            char tmp[1];
+            int peek = recv(session->players[i].socket, tmp, 1, MSG_PEEK);
+            if (peek <= 0) {
+                printf("[!] %s se desconectó antes de ubicar el barco\n", session->players[i].name);
+                int other = (i == 0) ? 1 : 0;
+                send_message(session->players[other].socket, "GAME_OVER", "OPPONENT_DISCONNECTED");
+                send_message(session->players[other].socket, "VICTORY", "WINNING_PLAYER");
+                log_game_end(log_file, session->players[other].name, session->players[i].name);
+                session->game_over = true;
+                fclose(log_file);
+                return NULL;
+            }
+
+            // Recibir posición real
             char buffer[BUFFER_SIZE] = {0};
             int bytes = recv(session->players[i].socket, buffer, BUFFER_SIZE, 0);
             if (bytes <= 0 || strncmp(buffer, "SHIP_POS|", 9) != 0) {
@@ -211,74 +247,140 @@ void* handle_game_session(void *arg) {
     session->current_turn = 0;
     session->game_over = false;
 
+    // Comienzo de turnos
     while (!session->game_over) {
         Player *current = &session->players[session->current_turn];
         Player *opponent = &session->players[(session->current_turn + 1) % MAX_PLAYERS];
 
-        send_message(current->socket, "YOUR_TURN", "Dispara con ROW,COL o R para rendirte");
-        send_message(opponent->socket, "WAIT_TURN", "Espera al oponente");
+        char msg[BUFFER_SIZE];
+        snprintf(msg, sizeof(msg), "Tienes %d segundos", TURN_TIME_SECONDS);
+        send_message(current->socket, "YOUR_TURN", msg);
+        send_message(opponent->socket, "WAIT_TURN", "OPPONENT_TURN");
 
-        char buffer[BUFFER_SIZE] = {0};
-        int bytes = recv(current->socket, buffer, BUFFER_SIZE, 0);
-        if (bytes <= 0 || strncmp(buffer, "QUIT|", 5) == 0) {
-            send_message(current->socket, "GAME_OVER", "YOU_QUIT");
-            send_message(opponent->socket, "GAME_OVER", "OPPONENT_QUIT");
-            log_game_end(log_file, opponent->name, current->name);
-            break;
-        }
+        turn_start_time = time(NULL);
+        int turn_active = 1;
 
-        int row, col;
-        if (sscanf(buffer, "%d,%d", &row, &col) != 2 || row < 0 || row >= BOARD_SIZE || col < 0 || col >= BOARD_SIZE) {
-            send_message(current->socket, "ERROR", "POSICION_INVALIDA");
-            continue;
-        }
+        while (turn_active && !session->game_over) {
+            fd_set read_fds;
+            FD_ZERO(&read_fds);
+            FD_SET(current->socket, &read_fds);
+            FD_SET(opponent->socket, &read_fds);
+            int max_fd = current->socket > opponent->socket ? current->socket : opponent->socket;
 
-        char cell = opponent->board.board[row][col];
-        if (cell == SHIP) {
-            opponent->board.board[row][col] = HIT;
-            send_message(current->socket, "RESULT", "HIT");
-            char info[32];
-            snprintf(info, sizeof(info), "%d,%d", row, col);
-            send_message(opponent->socket, "ENEMY_HIT", info);
+            int remaining = TURN_TIME_SECONDS - (int)difftime(time(NULL), turn_start_time);
+            struct timeval tv = { .tv_sec = 1, .tv_usec = 0 };
 
-            for (int s = 0; s < opponent->board.ship_count; s++) {
-                Ship *ship = &opponent->board.ships[s];
-                for (int i = 0; i < ship->size; i++) {
-                    if (ship->positions[i][0] == row && ship->positions[i][1] == col) {
-                        ship->hits++;
-                        break;
-                    }
-                }
+            int ready = select(max_fd + 1, &read_fds, NULL, NULL, &tv);
+            if (ready < 0) {
+                perror("select");
+                session->game_over = true;
+                break;
             }
 
-            bool all_sunk = true;
-            for (int s = 0; s < opponent->board.ship_count; s++) {
-                if (opponent->board.ships[s].hits < opponent->board.ships[s].size) {
-                    all_sunk = false;
+            // Verificar si el oponente se desconectó (aunque no sea su turno)
+            if (FD_ISSET(opponent->socket, &read_fds)) {
+                char tmp[1];
+                int bytes = recv(opponent->socket, tmp, 1, MSG_PEEK);
+                if (bytes <= 0) {
+                    printf("[!] %s se desconectó (fuera de turno)\n", opponent->name);
+                    send_message(current->socket, "GAME_OVER", "OPPONENT_DISCONNECTED");
+                    send_message(current->socket, "VICTORY", "WINNING_PLAYER");
+                    log_game_end(log_file, current->name, opponent->name);
+                    session->game_over = true;
                     break;
                 }
             }
 
-            if (all_sunk) {
-                send_message(current->socket, "GAME_OVER", "YOU_WIN");
-                send_message(opponent->socket, "GAME_OVER", "YOU_LOSE");
-                log_game_end(log_file, current->name, opponent->name);
-                session->game_over = true;
+            if (remaining <= 0) {
+                send_message(current->socket, "TURN_END", "TIME_OUT");
+                printf("Tiempo agotado para %s\n", current->name);
                 break;
             }
-        } else {
-            opponent->board.board[row][col] = WATER;
-            send_message(current->socket, "RESULT", "MISS");
+
+            if (FD_ISSET(current->socket, &read_fds)) {
+                char buffer[BUFFER_SIZE] = {0};
+                int bytes = recv(current->socket, buffer, BUFFER_SIZE, 0);
+
+                if (bytes <= 0) {
+                    printf("[!] %s se desconectó\n", current->name);
+                    send_message(opponent->socket, "GAME_OVER", "OPPONENT_DISCONNECTED");
+                    send_message(opponent->socket, "VICTORY", "WINNING_PLAYER");
+                    log_game_end(log_file, opponent->name, current->name);
+                    session->game_over = true;
+                    break;
+                }
+
+                if (strncmp(buffer, "QUIT|", 5) == 0) {
+                    send_message(current->socket, "GAME_OVER", "YOU_QUIT");
+                    send_message(opponent->socket, "GAME_OVER", "OPPONENT_QUIT");
+                    log_game_end(log_file, opponent->name, current->name);
+                    session->game_over = true;
+                    break;
+                }
+
+                int row, col;
+                if (sscanf(buffer, "%d,%d", &row, &col) != 2 || row < 0 || row >= BOARD_SIZE || col < 0 || col >= BOARD_SIZE) {
+                    send_message(current->socket, "ERROR", "POSICION_INVALIDA");
+                    continue;
+                }
+
+                // Disparo válido
+                char cell = opponent->board.board[row][col];
+                char info[32];
+                snprintf(info, sizeof(info), "%d,%d", row, col);
+                send_message(opponent->socket, "ENEMY_HIT", info);
+
+                if (cell == SHIP) {
+                    opponent->board.board[row][col] = HIT;
+                    send_message(current->socket, "RESULT", "HIT");
+
+                    for (int s = 0; s < opponent->board.ship_count; s++) {
+                        Ship *ship = &opponent->board.ships[s];
+                        for (int i = 0; i < ship->size; i++) {
+                            if (ship->positions[i][0] == row && ship->positions[i][1] == col) {
+                                ship->hits++;
+                                break;
+                            }
+                        }
+                    }
+
+                    bool all_sunk = true;
+                    for (int s = 0; s < opponent->board.ship_count; s++) {
+                        if (opponent->board.ships[s].hits < opponent->board.ships[s].size) {
+                            all_sunk = false;
+                            break;
+                        }
+                    }
+
+                    if (all_sunk) {
+                        send_message(current->socket, "GAME_OVER", "YOU_WIN");
+                        send_message(opponent->socket, "GAME_OVER", "YOU_LOSE");
+                        log_game_end(log_file, current->name, opponent->name);
+                        session->game_over = true;
+                    }
+                } else {
+                    opponent->board.board[row][col] = WATER;
+                    send_message(current->socket, "RESULT", "MISS");
+                }
+
+                turn_active = 0;
+            }
         }
 
-        advance_turn(session);
+        if (!session->game_over) {
+            advance_turn(session);
+            printf("Turno cambiado a %s\n", session->players[session->current_turn].name);
+        }
     }
 
-    for (int i = 0; i < MAX_PLAYERS; i++) close(session->players[i].socket);
+    for (int i = 0; i < MAX_PLAYERS; i++) {
+        close(session->players[i].socket);
+    }
     session->active = false;
     fclose(log_file);
     return NULL;
 }
+
 
 int accept_players(SessionManager *manager, int server_fd) {
     struct sockaddr_in address;
