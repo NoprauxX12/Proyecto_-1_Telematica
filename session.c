@@ -15,6 +15,8 @@
 #include <time.h>
 #include <sys/select.h>
 
+
+
 ShipType SHIPS[MAX_SHIPS] = {
     {"Portaavion", 5}, {"Buque de Guerra", 4}, {"Crucero1", 3},
     {"Crucero2", 3}, {"Destructor1", 2}, {"Destructor2", 2},
@@ -95,7 +97,7 @@ void handle_turn_change(GameSession *session) {
 
 void* handle_game_session(void *arg) {
     GameSession *session = (GameSession *)arg;
-    FILE *log_file = fopen(LOG_FILE, "a");
+    FILE *log_file = global_log_file ? global_log_file : fopen(LOG_FILE, "a");
     if (!log_file) return NULL;
 
     log_game_start(log_file, session->players[0].name, session->players[1].name);
@@ -122,7 +124,6 @@ void* handle_game_session(void *arg) {
                 send_message(session->players[other].socket, "VICTORY", "WINNING_PLAYER");
                 log_game_end(log_file, session->players[other].name, session->players[i].name);
                 session->game_over = true;
-                fclose(log_file);
                 return NULL;
             }
 
@@ -130,7 +131,6 @@ void* handle_game_session(void *arg) {
             int bytes = recv(session->players[i].socket, buffer, BUFFER_SIZE, 0);
             if (bytes <= 0 || strncmp(buffer, "SHIP_POS|", 9) != 0) {
                 send_message(session->players[i].socket, "ERROR", "INVALID_SHIP_POSITION");
-                fclose(log_file);
                 return NULL;
             }
 
@@ -139,7 +139,6 @@ void* handle_game_session(void *arg) {
             sscanf(buffer + 9, "%d,%d,%c", &row, &col, &orientation);
             if (!place_ship(&session->players[i].board, SHIPS[s].name, SHIPS[s].size, row, col, orientation)) {
                 send_message(session->players[i].socket, "ERROR", "INVALID_SHIP_POSITION");
-                fclose(log_file);
                 return NULL;
             }
         }

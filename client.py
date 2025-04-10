@@ -4,26 +4,25 @@ import signal
 import select
 from datetime import datetime
 
-HOST = "localhost"
+HOST = "127.0.0.1"
 PORT = 8080
 
 class BattleshipClient:
-    def __init__(self):
+    def __init__(self, log_path):
         self.sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         self.name = ""
         self.my_turn = False
         self.my_board = [['~'] * 10 for _ in range(10)]
         self.enemy_board = [['~'] * 10 for _ in range(10)]
         self.last_shot = (-1, -1)
-        self.log_file = None
+        self.log_file = open(log_path, "w")
 
         signal.signal(signal.SIGINT, self.handle_sigint)
 
     def log(self, msg):
         timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        if self.log_file:
-            self.log_file.write(f"[{timestamp}] {msg}\n")
-            self.log_file.flush()
+        self.log_file.write(f"[{timestamp}] {msg}\n")
+        self.log_file.flush()
 
     def handle_sigint(self, sig, frame):
         print("\n[Cerrando conexión por Ctrl+C]")
@@ -50,8 +49,6 @@ class BattleshipClient:
         if response != "LOGIN|OK":
             print("Error en el login")
             sys.exit(1)
-
-        self.log_file = open(f"log_{self.name}.txt", "w")
         self.log("Login exitoso. Esperando oponente...")
         print("Login exitoso. Esperando oponente...")
 
@@ -219,9 +216,13 @@ class BattleshipClient:
         self.login()
         self.handle_game_loop()
         self.sock.close()
-        if self.log_file:
-            self.log_file.close()
+        self.log_file.close()
 
 if __name__ == "__main__":
-    client = BattleshipClient()
+    if len(sys.argv) != 2:
+        print("Uso: ./client <ruta_del_log>")
+        sys.exit(1)
+    
+    log_path = sys.argv[1]
+    client = BattleshipClient(log_path)
     client.run()
