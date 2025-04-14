@@ -4,7 +4,7 @@ import signal
 import select
 from datetime import datetime
 
-HOST = "127.0.0.1"
+HOST = "localhost"
 PORT = 8080
 
 class BattleshipClient:

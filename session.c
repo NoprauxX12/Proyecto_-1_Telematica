@@ -15,8 +15,6 @@
 #include <time.h>
 #include <sys/select.h>
 
-
-
 ShipType SHIPS[MAX_SHIPS] = {
     {"Portaavion", 5}, {"Buque de Guerra", 4}, {"Crucero1", 3},
     {"Crucero2", 3}, {"Destructor1", 2}, {"Destructor2", 2},
@@ -239,13 +237,18 @@ void* handle_game_session(void *arg) {
                         handle_turn_change(session);
                         break;
                     }
-                } else {
+                }
+
+                if (cell == EMPTY) {
                     opponent->board.board[row][col] = WATER;
                     send_message(current->socket, "RESULT", "MISS");
                     fprintf(log_file, "fallo.\n");
                     handle_turn_change(session);
                     break;
                 }
+
+                send_message(current->socket, "ERROR", "CELDA_INVALIDA");
+                fprintf(log_file, "celda inválida: %c\n", cell);
             }
         }
 
