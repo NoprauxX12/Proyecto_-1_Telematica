@@ -11,11 +11,11 @@
 #define MAX_SESSIONS 10
 #define BOARD_SIZE 10
 #define MAX_SHIPS 9
-
-#define WATER '~'
+#define WATER '*'
 #define HIT 'X'
 #define SUNK '#'
 #define SHIP 'O'
+#define EMPTY '~'
 
 #define LOG_FILE "game_log.txt"
 #define LOG_DATE_FORMAT "%Y-%m-%d %H:%M:%S"

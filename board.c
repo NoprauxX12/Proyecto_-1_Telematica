@@ -5,7 +5,7 @@
 void init_board(Board *board) {
     for (int i = 0; i < BOARD_SIZE; i++)
         for (int j = 0; j < BOARD_SIZE; j++)
-            board->board[i][j] = WATER;
+            board->board[i][j] = EMPTY;  // 
     board->ship_count = 0;
 }
 
@@ -18,7 +18,7 @@ bool place_ship(Board *board, const char *ship_name, int size, int row, int col,
     for (int i = 0; i < size; i++) {
         int r = row + (orientation == 'V' ? i : 0);
         int c = col + (orientation == 'H' ? i : 0);
-        if (board->board[r][c] != WATER) return false;
+        if (board->board[r][c] != EMPTY) return false;
     }
 
     Ship *ship = &board->ships[board->ship_count];
